@@ -1,0 +1,11 @@
+{
+  "name": "flipper-claude-remote",
+  "owner": { "name": "flipper-claude-remote contributors" },
+  "plugins": [
+    {
+      "name": "flipper-claude-buddy",
+      "description": "Flipper Zero hardware controller for Claude Code (Windows-capable port)",
+      "source": "./plugin"
+    }
+  ]
+}

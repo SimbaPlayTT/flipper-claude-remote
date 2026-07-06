@@ -1,0 +1,15 @@
+# Flipper build artifacts (ufbt)
+flipper/claude_buddy/dist/
+flipper/claude_buddy/.vscode/
+flipper/claude_buddy/.ufbt/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
