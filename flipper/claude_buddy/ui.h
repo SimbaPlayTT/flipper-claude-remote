@@ -4,12 +4,15 @@
 #include <gui/gui.h>
 #include <gui/view.h>
 #include <gui/view_dispatcher.h>
+#include <gui/modules/text_input.h>
 
 typedef enum {
     ViewIdStatus,
     ViewIdMenu,
     ViewIdPerm,
     ViewIdInfo,
+    ViewIdTerm,
+    ViewIdKeyboard,
 } ViewId;
 
 typedef enum {
@@ -39,6 +42,8 @@ typedef enum {
     UiEventCtrlE,        // transcript mode: Ctrl+E
     UiEventShiftTab,     // toggle plan mode (Shift+Tab)
     UiEventToggleBleMode, // BLE profile toggled between Bridge and Desktop
+    UiEventPickSelect,    // option picker: data = selected index as string
+    UiEventKeyboardSubmit, // Flipper keyboard: data = typed text
 } UiEventType;
 
 typedef enum {
@@ -74,11 +79,19 @@ typedef struct {
 
 #define MAX_MENU_ITEMS 256
 #define MAX_MENU_ITEM_LEN 27
+#define MAX_PICK_ITEMS 8
 
 typedef struct {
     int index;
     int count;
     char items[MAX_MENU_ITEMS][MAX_MENU_ITEM_LEN];
+    /* Option-picker overlay (Claude asked a multi-choice question).
+     * Kept separate so the slash-command list survives a pick prompt. */
+    bool pick_mode;
+    char pick_title[24];
+    int pick_index;
+    int pick_count;
+    char pick_items[MAX_PICK_ITEMS][MAX_MENU_ITEM_LEN];
 } MenuModel;
 
 typedef struct {
@@ -100,6 +113,12 @@ typedef enum {
 } InfoPage;
 
 typedef struct {
+    int scroll;         /* index of the first visible line */
+    bool follow;        /* auto-scroll to the newest line on append */
+    uint8_t anim_frame; /* drives the blinking cursor in the status bar */
+} TermModel;
+
+typedef struct {
     InfoPage page;
     int index;      // selected item on menu page
     int scroll;     // vertical scroll offset (help / transcript)
@@ -113,6 +132,9 @@ typedef struct {
     View* menu_view;
     View* perm_view;
     View* info_view;
+    View* term_view;
+    TextInput* keyboard;
+    char kb_buf[128];
     FuriTimer* anim_timer;
     UiEventCallback event_callback;
     void* event_context;
@@ -133,6 +155,12 @@ void ui_set_transport_mode(UiState* ui, bool is_bt);
 void ui_update_menu(UiState* ui, const char* pipe_delimited);
 void ui_show_permission(UiState* ui, const char* tool, const char* detail, bool allow_always);
 void ui_show_info(UiState* ui);
+void ui_show_term(UiState* ui);
+void ui_term_append(UiState* ui, const char* pipe_delimited);
+void ui_term_clear(UiState* ui);
+void ui_term_set_status(UiState* ui, const char* text);
+void ui_show_pick(UiState* ui, const char* title, const char* pipe_delimited);
+void ui_show_keyboard(UiState* ui);
 void ui_back_to_status(UiState* ui);
 void ui_set_muted(UiState* ui, bool muted);
 void ui_set_rssi(UiState* ui, int rssi);

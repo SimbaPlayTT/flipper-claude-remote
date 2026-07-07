@@ -63,6 +63,8 @@ static MsgType parse_type(const char* type_str) {
     if(strcmp(type_str, "menu") == 0) return MsgTypeMenu;
     if(strcmp(type_str, "state") == 0) return MsgTypeState;
     if(strcmp(type_str, "perm") == 0) return MsgTypePerm;
+    if(strcmp(type_str, "term") == 0) return MsgTypeTerm;
+    if(strcmp(type_str, "pick") == 0) return MsgTypePick;
     return MsgTypeUnknown;
 }
 
@@ -95,6 +97,15 @@ bool protocol_parse(const char* json_line, ProtocolMessage* msg) {
         json_get_string(d_start, "line2", msg->text2, sizeof(msg->text2));
         break;
     case MsgTypeMenu:
+        json_get_string(d_start, "items", msg->menu_data, sizeof(msg->menu_data));
+        break;
+    case MsgTypeTerm:
+        json_get_string(d_start, "lines", msg->menu_data, sizeof(msg->menu_data));
+        json_get_bool(d_start, "clr", &msg->term_clr);
+        json_get_bool(d_start, "show", &msg->term_show);
+        break;
+    case MsgTypePick:
+        json_get_string(d_start, "title", msg->text, sizeof(msg->text));
         json_get_string(d_start, "items", msg->menu_data, sizeof(msg->menu_data));
         break;
     case MsgTypeState:
@@ -200,6 +211,31 @@ int protocol_build_ctrl_e(char* buf, int buf_size) {
 
 int protocol_build_shift_tab(char* buf, int buf_size) {
     return build_simple(buf, buf_size, "shift_tab");
+}
+
+int protocol_build_text(char* buf, int buf_size, const char* text) {
+    if(!buf || buf_size <= 0) return 0;
+    /* Sanitize for our minimal JSON framing: the host does no unescaping
+     * beyond standard JSON, so replace the two characters that would
+     * break the string literal. */
+    char clean[160];
+    int n = 0;
+    for(const char* p = text; p && *p && n < (int)sizeof(clean) - 1; p++) {
+        char c = *p;
+        if(c == '"') c = '\'';
+        if(c == '\\') c = '/';
+        if((unsigned char)c < 32) c = ' ';
+        clean[n++] = c;
+    }
+    clean[n] = '\0';
+    return snprintf(
+        buf, buf_size, "{\"v\":1,\"t\":\"text\",\"d\":{\"text\":\"%s\"}}\n", clean);
+}
+
+int protocol_build_pick_resp(char* buf, int buf_size, int idx) {
+    if(!buf || buf_size <= 0) return 0;
+    return snprintf(
+        buf, buf_size, "{\"v\":1,\"t\":\"pick_resp\",\"d\":{\"idx\":%d}}\n", idx);
 }
 
 int protocol_build_perm_resp(char* buf, int buf_size, bool allow, bool always, bool esc) {

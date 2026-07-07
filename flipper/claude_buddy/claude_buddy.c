@@ -19,6 +19,7 @@
 
 #include <furi.h>
 #include <furi_hal.h>
+#include <stdlib.h>
 #include <furi_hal_power.h>
 #include <furi_hal_rtc.h>
 #include <datetime/datetime.h>
@@ -35,6 +36,7 @@
 #include "notifications.h"
 #include "ui.h"
 #include "app_settings.h"
+#include "term_buf.h"
 
 #define TAG "ClaudeBuddy"
 
@@ -397,6 +399,7 @@ static void process_message(App* app, ProtocolMessage* msg) {
         }
 
         if(msg->text[0] && !is_voice) {
+            ui_term_set_status(app->ui, msg->text);
             if(msg->text2[0]) {
                 ui_show_status2(app->ui, msg->text, msg->text2, true);
             } else {
@@ -433,6 +436,7 @@ static void process_message(App* app, ProtocolMessage* msg) {
         app->is_working = true;
         notify_play(app->notifications, SoundLedWorking, LedStateOff); // LED-only, not subject to mute
         ui_set_pose(app->ui, PoseThinking);
+        ui_term_set_status(app->ui, msg->text[0] ? msg->text : "Thinking...");
         ui_show_status2(
                 app->ui,
                 msg->text[0] ? msg->text : "Thinking...",
@@ -469,6 +473,21 @@ static void process_message(App* app, ProtocolMessage* msg) {
 
     case MsgTypeState:
         ui_set_claude_connected(app->ui, msg->claude_connected);
+        ui_term_set_status(app->ui, msg->claude_connected ? "Ready" : "No session");
+        break;
+
+    case MsgTypeTerm:
+        if(msg->term_clr) ui_term_clear(app->ui);
+        if(msg->menu_data[0]) ui_term_append(app->ui, msg->menu_data);
+        if(msg->term_show) ui_show_term(app->ui);
+        break;
+
+    case MsgTypePick:
+        /* Claude asked a multi-choice question — surface the options. */
+        if(msg->menu_data[0]) {
+            if(!app->muted) notify_play(app->notifications, SoundPerm, LedStateOff);
+            ui_show_pick(app->ui, msg->text, msg->menu_data);
+        }
         break;
 
     case MsgTypeAnthropicHB: {
@@ -755,6 +774,23 @@ static void on_ui_event(UiEventType event, const char* data, void* context) {
         ui_back_to_status(app->ui);
         break;
 
+    case UiEventPickSelect:
+        if(data) {
+            app_notify(app, SoundCmd);
+            len = protocol_build_pick_resp(app->tx_buf, sizeof(app->tx_buf), atoi(data));
+            transport_send(app->transport, app->tx_buf, len);
+        }
+        ui_back_to_status(app->ui);
+        break;
+
+    case UiEventKeyboardSubmit:
+        if(data && data[0]) {
+            app_notify(app, SoundEnter);
+            len = protocol_build_text(app->tx_buf, sizeof(app->tx_buf), data);
+            transport_send(app->transport, app->tx_buf, len);
+        }
+        break;
+
     case UiEventDismiss:
         ui_back_to_status(app->ui);
         break;
@@ -883,6 +919,9 @@ int32_t claude_buddy_app(void* p) {
     /* Serial → GUI message queue (allocates memory internally to copy ProtocolMessage by value) */
     app->serial_queue = furi_message_queue_alloc(SERIAL_QUEUE_SIZE, sizeof(ProtocolMessage));
 
+    /* Terminal ring buffer — must exist before the UI draws it. */
+    term_buf_init();
+
     /* UI */
     app->ui = ui_alloc(gui);
     ui_set_event_callback(app->ui, on_ui_event, app);
@@ -945,6 +984,7 @@ int32_t claude_buddy_app(void* p) {
     nus_charpack_free();
     nus_transcript_free();
     ui_free(app->ui);
+    term_buf_free();
 
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);

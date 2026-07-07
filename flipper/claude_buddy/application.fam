@@ -5,7 +5,7 @@ App(
     entry_point="claude_buddy_app",
     requires=["gui", "notification", "bt", "storage"],
     stack_size=4 * 1024,
-    fap_version="0.6",
+    fap_version="0.7",
     fap_icon="icons/claude_10x10.png",
     fap_category="Bluetooth",
     fap_description="Claude Code companion - physical remote control with audio feedback",
@@ -22,6 +22,7 @@ App(
         "nus_transcript.c",# Desktop-mode transcript ring buffer
         "nus_charpack.c",  # Folder-push receiver for character packs
         "app_settings.c",  # Persisted per-app settings (BleMode)
+        "term_buf.c",      # Bridge-mode terminal ring buffer
         "ui.c",
         "notifications.c",
     ],

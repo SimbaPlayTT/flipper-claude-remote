@@ -82,6 +82,35 @@ def display(text: str, subtext: str = "") -> dict | None:
     return send_request({"action": "display", "text": text, "subtext": subtext})
 
 
+def term(
+    text: str,
+    clear: bool = False,
+    show: bool = False,
+    title: str = "",
+    transcript_path: str = "",
+    summarize: bool = False,
+) -> dict | None:
+    """Append text to the Flipper's Terminal view (hold RIGHT to open).
+    The bridge wraps/sanitizes the text for the 128px screen; with
+    ``summarize`` it condenses the text on the PC first."""
+    return send_request(
+        {
+            "action": "term",
+            "text": text,
+            "clear": clear,
+            "show": show,
+            "title": title,
+            "transcript_path": transcript_path,
+            "summarize": summarize,
+        }
+    )
+
+
+def ask_options(question: str, options: list[str]) -> dict | None:
+    """Show a multi-choice question's options as a picker on the Flipper."""
+    return send_request({"action": "ask_options", "question": question, "options": options})
+
+
 # ---------------------------------------------------------------------------
 # Process helpers shared by the session-start / session-end hooks
 # ---------------------------------------------------------------------------

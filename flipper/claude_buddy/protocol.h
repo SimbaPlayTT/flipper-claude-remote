@@ -14,6 +14,8 @@ typedef enum {
     MsgTypeMenu,
     MsgTypeState,
     MsgTypePerm,
+    MsgTypeTerm, /* terminal text lines for the Terminal view */
+    MsgTypePick, /* option picker (Claude asked a multi-choice question) */
     // Flipper -> Host
     MsgTypeCmd,
     MsgTypeEnter,
@@ -37,7 +39,9 @@ typedef struct {
     bool vibro;
     char text[PROTOCOL_MAX_FIELD_LEN];   // line1
     char text2[PROTOCOL_MAX_FIELD_LEN];  // line2 (subtext)
-    char menu_data[PROTOCOL_MAX_MSG_LEN]; // pipe-delimited menu items
+    char menu_data[PROTOCOL_MAX_MSG_LEN]; // pipe-delimited menu items / term lines
+    bool term_clr;  // term: clear the terminal buffer before appending
+    bool term_show; // term: switch to the Terminal view after appending
     bool claude_connected; // claude code session state
     bool has_rssi;
     int16_t rssi;
@@ -88,3 +92,7 @@ int protocol_build_pgdown(char* buf, int buf_size);
 int protocol_build_ctrl_o(char* buf, int buf_size);
 int protocol_build_ctrl_e(char* buf, int buf_size);
 int protocol_build_shift_tab(char* buf, int buf_size);
+/* Free text typed on the Flipper keyboard (host types it + Enter). */
+int protocol_build_text(char* buf, int buf_size, const char* text);
+/* Selected option index for a "pick" prompt. */
+int protocol_build_pick_resp(char* buf, int buf_size, int idx);

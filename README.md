@@ -2,7 +2,7 @@
 
 **Claude Buddy for Windows** — a Windows-capable port of [jxw1102/flipper-claude-buddy](https://github.com/jxw1102/flipper-claude-buddy) (MIT), which turns a Flipper Zero into a physical remote control and status display for **Claude Code**.
 
-The Flipper app (`.fap`) is the **unmodified upstream Claude Buddy app** — same UI, same screens, same sounds, 1:1. All Windows work lives on the host side: the Python bridge daemon and the Claude Code plugin hooks were ported so the whole system runs on Windows (upstream supports macOS/Linux only).
+The Flipper app (`.fap`) started as the unmodified upstream Claude Buddy app (same UI, screens and sounds) and is now a **light fork (v0.7)**: it adds a **Terminal view** (hold RIGHT) that shows Claude's replies on the Flipper and renders slash-command screens (`/usage`, `/context`, `/cost`, `/status`, `/stats`) on-device. Everything else on the Flipper is upstream code. The host side — Python bridge daemon and Claude Code plugin hooks — is fully ported to Windows (upstream supports macOS/Linux only).
 
 ```
 Flipper Zero (claude_buddy.fap — vendored upstream, UI 1:1)
@@ -109,7 +109,7 @@ When asked, set **transport** to `auto` (default), `usb`, or `ble`. The bridge d
 | LEFT | Interrupt Claude (Esc) |
 | LEFT (hold) | Send Ctrl+C |
 | RIGHT | Open slash command menu |
-| RIGHT (hold) | Open menu |
+| RIGHT (hold) | Open the **Terminal view** (Claude's replies + command screens) |
 | OK | Submit Enter (⏎) |
 | OK (hold) | Type "yes" and submit |
 | DOWN | Send Down arrow (↓) |
@@ -117,7 +117,31 @@ When asked, set **transport** to `auto` (default), `usb`, or `ble`. The bridge d
 | BACK | Send Backspace (⌫) |
 | BACK (hold) | Exit |
 
-The on-device menu, status display, transcript view, permission prompts (Allow / Deny on the Flipper), and Claude Desktop (BLE) mode all work exactly as upstream — same code.
+The on-device status display, permission prompts (Allow / Deny on the Flipper), and Claude Desktop (BLE) mode all work exactly as upstream — same code. The old info menu (Transcript / Help / About / BLE mode) moved: it now opens by **holding RIGHT inside the Terminal view**.
+
+## Terminal view (new in this fork)
+
+Hold **RIGHT** on the status screen to open **TERMINAL** — a scrollback of the session, streamed by the bridge over USB or BLE:
+
+- Every prompt you submit appears as `> your prompt`; at the end of each turn the bridge **summarizes what Claude did/said on the PC** (a small local Haiku call via your existing Claude Code credentials) and streams the summary in as `* ...` (raw excerpt as fallback when offline).
+- A CLI-style **status bar** at the bottom (`> Thinking...` with a blinking cursor) mirrors what the CLI is doing.
+- **OK** opens the Flipper's **keyboard** — type a prompt on the device and it is typed into the terminal and submitted. **Hold OK** opens the slash-command menu.
+- **UP/DOWN** scroll by line, **LEFT/RIGHT** page; scrolling to the bottom re-enables auto-follow.
+- **BACK** returns to the status screen; **hold RIGHT** opens the old menu (Transcript / Help / About / BLE mode).
+
+**Multi-choice questions** — when Claude asks a question with options (AskUserQuestion), the options pop up as a picker on the Flipper; selecting one drives the CLI's selector (Down×n + Enter). BACK dismisses and leaves the question to the terminal.
+
+**Slash-command screens** — picking these in the command menu renders the answer *on the Flipper* instead of typing into your terminal:
+
+| Command | Shows |
+|---|---|
+| `/usage` | Real plan limits (5-hour session %, weekly %, per-model %) with reset times, plus local token counts |
+| `/context` | Current context size with a fill bar |
+| `/cost` | Estimated session/today cost (API list prices) |
+| `/status` | Bridge transport, connection states, project, uptime |
+| `/stats` | Tool-call counts for the current turn |
+
+All other slash commands are typed into the host terminal as before — and Claude's response then shows up in the Terminal view at the end of the turn. The token/cost figures are computed from your local `~/.claude/projects` transcripts, so they reflect this machine's activity (not account-level plan usage).
 
 ## Windows connection notes
 

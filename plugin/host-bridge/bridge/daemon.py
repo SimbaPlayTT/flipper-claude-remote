@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import OrderedDict
 from pathlib import Path
-from . import config, protocol
+from . import config, protocol, slashview, summarize
 from .claude_ipc import ClaudeIPC
 from .serial_conn import SerialConnection
 from .transport import Transport
@@ -30,6 +31,8 @@ class Daemon:
         self._space_repeat_task: asyncio.Task | None = None
         self._session_targets: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._shutdown_event = asyncio.Event()
+        self._transcript_path = ""  # active session transcript (from hooks)
+        self._started_at = time.monotonic()
 
         self.serial.on_message(self._handle_flipper_msg)
         self.serial.on_connect(self._send_initial_state)
@@ -76,10 +79,39 @@ class Daemon:
             text = data.get("text", "")
             if text:
                 text = self._cmd_map.get(text, text)
+                # Some slash commands render directly on the Flipper's
+                # Terminal view instead of being typed into the host
+                # terminal (/usage, /context, /cost, /status, /stats).
+                if await self._maybe_render_slash_view(text):
+                    return
                 await self._input.send_chars(text + " ")
 
         elif msg_type == "yes":
             await self._send_to_claude("yes")
+
+        elif msg_type == "text":
+            # Prompt typed on the Flipper's keyboard: type it into the
+            # terminal and submit.
+            text = str(data.get("text", "")).strip()
+            if text:
+                log.info("Flipper keyboard prompt: %r", text)
+                await self._input.send_chars(text)
+                await asyncio.sleep(0.15)
+                await self._send_keystroke("return")
+
+        elif msg_type == "pick_resp":
+            # Option chosen for an AskUserQuestion prompt: move the CLI's
+            # selector down to the option and confirm.
+            try:
+                idx = int(data.get("idx", 0))
+            except (TypeError, ValueError):
+                idx = 0
+            log.info("Flipper picked option %d", idx)
+            for _ in range(max(0, idx)):
+                await self._send_keystroke("down")
+                await asyncio.sleep(0.12)
+            await asyncio.sleep(0.12)
+            await self._send_keystroke("return")
 
         elif msg_type == "enter":
             await self._send_keystroke("return")
@@ -175,6 +207,12 @@ class Daemon:
     async def _handle_ipc_action(self, request: dict) -> dict:
         action = request.get("action", "")
 
+        # Any hook may piggyback the active session's transcript path;
+        # the slash-command views (/usage, /context, /cost) need it.
+        transcript_path = str(request.get("transcript_path", "") or "")
+        if transcript_path:
+            self._transcript_path = transcript_path
+
         if action == "notify":
             if self._perm_future and not self._perm_future.done():
                 log.info("Dismissing pending permission (deferring to Claude)")
@@ -263,6 +301,43 @@ class Daemon:
                 return {"status": "timeout"}
             finally:
                 self._perm_future = None
+
+        elif action == "term":
+            # Append text to the Flipper's Terminal view (hold RIGHT on the
+            # status screen). Used by hooks to stream prompts and Claude's
+            # replies; `show` pops the view open, `clear` wipes it first.
+            text = request.get("text", "")
+            title = str(request.get("title", "") or "")
+            clear = bool(request.get("clear", False))
+            show = bool(request.get("show", False))
+            if not self.serial.connected:
+                return {"status": "no_flipper"}
+            if request.get("summarize") and text:
+                # Summarize on the PC (small local API call) before it goes
+                # to the tiny screen; don't block the hook while doing so.
+                asyncio.create_task(self._summarize_to_term(text))
+                return {"status": "ok"}
+            lines = slashview.wrap_text(text)
+            if title:
+                lines = [slashview.header_line(title)] + lines
+            await self._send_term_lines(lines, clr=clear, show=show)
+            return {"status": "ok"}
+
+        elif action == "ask_options":
+            # Claude asked a multi-choice question: mirror it in the
+            # terminal and pop the option picker on the Flipper.
+            question = str(request.get("question", "") or "")
+            options = [str(o) for o in (request.get("options") or []) if str(o).strip()]
+            if not options:
+                return {"status": "no_options"}
+            if not self.serial.connected:
+                return {"status": "no_flipper"}
+            if question:
+                await self._send_term_lines(slashview.wrap_text("? " + question))
+            title = slashview.sanitize(question)[:20] or "CHOOSE"
+            items = [slashview.sanitize(o)[:26] for o in options[:8]]
+            await self.serial.send(protocol.pick_msg(title, items))
+            return {"status": "ok"}
 
         elif action == "shutdown":
             # Clean stop requested by a hook (used on Windows where there is
@@ -486,6 +561,65 @@ class Daemon:
         except Exception:
             return None
 
+    async def _send_term_lines(self, lines: list[str], clr: bool = False, show: bool = False):
+        """Ship terminal lines to the Flipper in transport-safe batches.
+
+        The Flipper's serial RX line buffer is PROTOCOL_MAX_MSG_LEN (2048)
+        bytes; 20 lines of <=32 chars plus JSON framing stays well under it
+        for both USB CDC and BLE (which chunks to the ATT MTU anyway).
+        """
+        BATCH = 20
+        if not lines:
+            lines = [""]
+        for i in range(0, len(lines), BATCH):
+            await self.serial.send(
+                protocol.term_msg(
+                    lines[i : i + BATCH],
+                    clr=clr and i == 0,
+                    show=show and i == 0,
+                )
+            )
+
+    async def _summarize_to_term(self, text: str):
+        """Summarize a turn's text and append the summary to the terminal."""
+        try:
+            summary = await asyncio.get_running_loop().run_in_executor(
+                None, summarize.summarize, text
+            )
+        except Exception as e:
+            log.warning("Summary task failed: %s", e)
+            summary = None
+        if not summary:
+            summary = text[:400].rstrip() + (" [...]" if len(text) > 400 else "")
+        log.info("Turn summary -> terminal (%d chars)", len(summary))
+        await self._send_term_lines(slashview.wrap_text("* " + summary + "\n"))
+
+    async def _maybe_render_slash_view(self, cmd: str) -> bool:
+        """Render /usage-style commands as a screen on the Flipper."""
+        base = cmd.strip().split()[0].lower() if cmd.strip() else ""
+        if base not in slashview.VIEW_COMMANDS:
+            return False
+        info = {
+            "transcript_path": self._transcript_path,
+            "project_dir": config.PROJECT_DIR,
+            "transport": type(self.serial._transport).__name__,
+            "flipper_connected": self.serial.connected,
+            "claude_connected": self._claude_connected,
+            "uptime_s": time.monotonic() - self._started_at,
+        }
+        try:
+            title, lines = await asyncio.get_running_loop().run_in_executor(
+                None, slashview.render, base, info
+            )
+        except Exception as e:
+            log.error("Slash view %s failed: %s", base, e)
+            title, lines = base, ["(error rendering view)"]
+        log.info("Rendering %s view on Flipper (%d lines)", base, len(lines))
+        await self._send_term_lines(
+            [slashview.header_line(title)] + lines, clr=True, show=True
+        )
+        return True
+
     async def _send_initial_state(self):
         """Wait for Flipper app to take over CDC, then send a ping.
         The actual state (menu, claude status) is sent on first pong or hello."""
@@ -557,6 +691,9 @@ class Daemon:
             "term_session_id": str(request.get("term_session_id", "")).strip(),
             "iterm_session_id": str(request.get("iterm_session_id", "")).strip(),
             "tty": str(request.get("tty", "")).strip(),
+            # Windows: HWND captured by the hook — the input backend
+            # refocuses this window before injecting keystrokes.
+            "window_id": str(request.get("window_id", "")).strip(),
         }
         if not target["session_key"]:
             return None
@@ -567,6 +704,7 @@ class Daemon:
                 target["term_session_id"],
                 target["iterm_session_id"],
                 target["tty"],
+                target["window_id"],
             )
         ):
             return None

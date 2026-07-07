@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "app_settings.h"
 #include "nus_transcript.h"
+#include "term_buf.h"
 #include <gui/elements.h>
 #include <string.h>
 #include <stdio.h>
@@ -79,6 +80,10 @@ static const char* default_menu_items[] = {
 };
 #define DEFAULT_MENU_COUNT 69
 
+// Keyboard callbacks (defined with the other keyboard code, used in ui_alloc)
+static void kb_done_cb(void* context);
+static uint32_t kb_prev_cb(void* context);
+
 // ── Layout ───────────────────────────────────────────────────────
 
 #define HDR_H  9   // inverted header bar height (y 0..8)
@@ -105,6 +110,10 @@ static void anim_tick(void* context) {
     InfoModel* im = view_get_model(ui->info_view);
     im->anim_frame++;
     view_commit_model(ui->info_view, true);
+
+    TermModel* tm = view_get_model(ui->term_view);
+    tm->anim_frame++;
+    view_commit_model(ui->term_view, true);
 }
 
 // ── Button Hints ─────────────────────────────────────────────────
@@ -572,13 +581,13 @@ static void status_draw(Canvas* canvas, void* model) {
             canvas_set_font(canvas, FontSecondary);
             // "Hold [►] for menu" with inline icon
             int hw = (int)canvas_string_width(canvas, "Hold ");
-            int fw = (int)canvas_string_width(canvas, " for menu");
+            int fw = (int)canvas_string_width(canvas, " for terminal");
             int sw = (int)canvas_string_width(canvas, " "); // space after icon
             int total = hw + 5 + sw + fw; // 5px icon width + space
             int hx = 77 - total / 2;
             canvas_draw_str(canvas, hx, 39, "Hold ");
             draw_help_icon(canvas, hx + hw, 39, HelpBtnRight);
-            canvas_draw_str(canvas, hx + hw + 6 + sw, 39, "for menu");
+            canvas_draw_str(canvas, hx + hw + 6 + sw, 39, "for terminal");
         }
     }
 
@@ -661,7 +670,16 @@ static bool status_input(InputEvent* event, void* context) {
         return true;
     }
     if(event->key == InputKeyRight && event->type == InputTypeLong) {
-        if(ui->event_callback) ui->event_callback(UiEventOpenInfo, NULL, ui->event_context);
+        /* Bridge mode: long-press Right opens the Terminal view (Claude's
+         * replies + slash-command views, streamed by the host bridge).
+         * The old info Menu moved inside it (hold Right again there).
+         * Desktop mode keeps the info Menu — the bridge terminal stream
+         * doesn't exist on that transport. */
+        if(app_settings_get_ble_mode() == BleModeDesktop) {
+            if(ui->event_callback) ui->event_callback(UiEventOpenInfo, NULL, ui->event_context);
+        } else {
+            ui_show_term(ui);
+        }
         return true;
     }
     if(event->key == InputKeyBack && event->type == InputTypeShort) {
@@ -681,6 +699,29 @@ static void menu_draw(Canvas* canvas, void* model) {
     if(!canvas || !model) return;
     MenuModel* m = model;
     canvas_clear(canvas);
+
+    if(m->pick_mode) {
+        // ── Option picker (Claude asked a multi-choice question) ──
+        draw_header(canvas, m->pick_title[0] ? m->pick_title : "CHOOSE", false);
+        const int item_h = 8;
+        const int list_y = 12;
+        canvas_set_font(canvas, FontSecondary);
+        for(int i = 0; i < m->pick_count && i < MAX_PICK_ITEMS; i++) {
+            int by = list_y + i * item_h;
+            if(i == m->pick_index) {
+                canvas_draw_rbox(canvas, 1, by - 2, 121, item_h + 1, 1);
+                canvas_set_color(canvas, ColorWhite);
+                canvas_draw_str(canvas, 5, by + 6, m->pick_items[i]);
+                canvas_set_color(canvas, ColorBlack);
+            } else {
+                canvas_draw_str(canvas, 5, by + 6, m->pick_items[i]);
+            }
+        }
+        draw_footer_sep(canvas);
+        hint_ok(canvas, "Select");
+        hint_back(canvas, "Dismiss");
+        return;
+    }
 
     // ── Header ──
     draw_header(canvas, "COMMANDS", false);
@@ -735,6 +776,41 @@ static bool menu_input(InputEvent* event, void* context) {
 
     MenuModel* m = view_get_model(ui->menu_view);
 
+    if(m->pick_mode) {
+        if(event->key == InputKeyUp) {
+            if(m->pick_count > 0)
+                m->pick_index = (m->pick_index > 0) ? m->pick_index - 1 : m->pick_count - 1;
+            view_commit_model(ui->menu_view, true);
+            return true;
+        }
+        if(event->key == InputKeyDown) {
+            if(m->pick_count > 0)
+                m->pick_index = (m->pick_index < m->pick_count - 1) ? m->pick_index + 1 : 0;
+            view_commit_model(ui->menu_view, true);
+            return true;
+        }
+        if(event->key == InputKeyOk) {
+            int idx = m->pick_index;
+            bool has = m->pick_count > 0;
+            m->pick_mode = false;
+            view_commit_model(ui->menu_view, false);
+            if(ui->event_callback && has) {
+                char idx_str[8];
+                snprintf(idx_str, sizeof(idx_str), "%d", idx);
+                ui->event_callback(UiEventPickSelect, idx_str, ui->event_context);
+            }
+            return true;
+        }
+        if(event->key == InputKeyBack) {
+            m->pick_mode = false;
+            view_commit_model(ui->menu_view, false);
+            if(ui->event_callback)
+                ui->event_callback(UiEventMenuBack, NULL, ui->event_context);
+            return true;
+        }
+        return true;
+    }
+
     if(event->key == InputKeyUp) {
         if(m->count > 0) m->index = (m->index > 0) ? m->index - 1 : m->count - 1;
         view_commit_model(ui->menu_view, true);
@@ -769,6 +845,132 @@ static bool menu_input(InputEvent* event, void* context) {
         return true;
     }
     return false;
+}
+
+// ── Terminal View ────────────────────────────────────────────────
+
+/* Bridge-mode terminal: shows text streamed from the host bridge
+ * (Claude's replies, submitted prompts, slash-command views).  Lines
+ * are pre-wrapped by the host; storage is the term_buf ring buffer. */
+
+#define TERM_VISIBLE 5
+#define TERM_LINE_H  8
+#define TERM_LIST_Y  12
+
+/* Status-bar text below the scrollback — mirrors the CLI's bottom line
+ * ("Thinking...", "Turn complete", "Ready", ...). Written on the GUI
+ * thread only. */
+static char term_status[28] = "Ready";
+
+void ui_term_set_status(UiState* ui, const char* text) {
+    if(!text || !text[0]) text = "Ready";
+    strncpy(term_status, text, sizeof(term_status) - 1);
+    term_status[sizeof(term_status) - 1] = '\0';
+    if(ui) view_commit_model(ui->term_view, ui->current_view == ViewIdTerm);
+}
+
+static void term_draw(Canvas* canvas, void* model) {
+    if(!canvas || !model) return;
+    TermModel* m = model;
+    canvas_clear(canvas);
+
+    draw_header(canvas, "TERMINAL", false);
+
+    int total = term_buf_count();
+    int max_scroll = (total > TERM_VISIBLE) ? (total - TERM_VISIBLE) : 0;
+    if(m->follow) m->scroll = max_scroll;
+    if(m->scroll < 0) m->scroll = 0;
+    if(m->scroll > max_scroll) m->scroll = max_scroll;
+
+    if(total == 0) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "(empty)");
+        canvas_draw_str_aligned(
+            canvas, 64, 38, AlignCenter, AlignCenter, "OK: type   hold OK: cmds");
+    } else {
+        canvas_set_font(canvas, FontSecondary);
+        char line[TERM_LINE_LEN];
+        for(int i = 0; i < TERM_VISIBLE && (m->scroll + i) < total; i++) {
+            if(term_buf_get(m->scroll + i, line, sizeof(line))) {
+                canvas_draw_str(canvas, 2, TERM_LIST_Y + 6 + i * TERM_LINE_H, line);
+            }
+        }
+        if(max_scroll > 0) {
+            draw_scrollbar(canvas, m->scroll, max_scroll + 1, HDR_H + 1, FTR_Y - 1);
+        }
+    }
+
+    /* CLI-style status bar: "> <status>" with a blinking block cursor. */
+    draw_footer_sep(canvas);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 61, ">");
+    canvas_draw_str(canvas, 9, 61, term_status);
+    int sw = (int)canvas_string_width(canvas, term_status);
+    if(m->anim_frame % 8 < 4) {
+        canvas_draw_box(canvas, 11 + sw, 55, 4, 7);
+    }
+}
+
+static bool term_input(InputEvent* event, void* context) {
+    if(!event || !context) return false;
+    UiState* ui = context;
+    if(
+        event->type != InputTypeShort && event->type != InputTypeRepeat &&
+        event->type != InputTypeLong)
+        return false;
+
+    TermModel* m = view_get_model(ui->term_view);
+    int total = term_buf_count();
+    int max_scroll = (total > TERM_VISIBLE) ? (total - TERM_VISIBLE) : 0;
+
+    if(event->key == InputKeyUp && event->type != InputTypeLong) {
+        if(m->scroll > 0) m->scroll--;
+        m->follow = false;
+        view_commit_model(ui->term_view, true);
+        return true;
+    }
+    if(event->key == InputKeyDown && event->type != InputTypeLong) {
+        if(m->scroll < max_scroll) m->scroll++;
+        if(m->scroll >= max_scroll) m->follow = true;
+        view_commit_model(ui->term_view, true);
+        return true;
+    }
+    if(event->key == InputKeyLeft && event->type != InputTypeLong) {
+        m->scroll -= TERM_VISIBLE; /* page up */
+        if(m->scroll < 0) m->scroll = 0;
+        m->follow = false;
+        view_commit_model(ui->term_view, true);
+        return true;
+    }
+    if(event->key == InputKeyRight && event->type == InputTypeShort) {
+        m->scroll += TERM_VISIBLE; /* page down */
+        if(m->scroll >= max_scroll) {
+            m->scroll = max_scroll;
+            m->follow = true;
+        }
+        view_commit_model(ui->term_view, true);
+        return true;
+    }
+    view_commit_model(ui->term_view, false);
+    if(event->key == InputKeyRight && event->type == InputTypeLong) {
+        /* The info Menu (Transcript / Help / About / BLE mode) lives here
+         * now that status hold-Right opens the terminal. */
+        ui_show_info(ui);
+        return true;
+    }
+    if(event->key == InputKeyOk && event->type == InputTypeShort) {
+        ui_show_keyboard(ui); /* type a prompt on the Flipper keyboard */
+        return true;
+    }
+    if(event->key == InputKeyOk && event->type == InputTypeLong) {
+        ui_show_menu(ui); /* run a slash command from inside the terminal */
+        return true;
+    }
+    if(event->key == InputKeyBack && event->type == InputTypeShort) {
+        ui_back_to_status(ui);
+        return true;
+    }
+    return true; /* swallow everything else so keys don't leak to status */
 }
 
 // ── Info View ────────────────────────────────────────────────────
@@ -811,7 +1013,7 @@ static int info_menu_step(int from, int delta) {
 
 static const char* about_lines[] = {
     "Claude Buddy",
-    "v0.6",
+    "v0.7 (Windows fork)",
     "Claude Code companion",
     "by jxw1102",
     "github.com/jxw1102",
@@ -837,13 +1039,18 @@ static const HelpEntry help_entries_bridge[] = {
     {HelpBtnLeft,  false, "Interrupt (Esc)"},
     {HelpBtnLeft,  true,  "Ctrl+C"},
     {HelpBtnRight, false, "Cmd menu"},
-    {HelpBtnRight, true,  "Menu"},
+    {HelpBtnRight, true,  "Terminal"},
     {HelpBtnOk,    false, "Enter"},
     {HelpBtnOk,    true,  "Yes + Enter"},
     {HelpBtnDown,  false, "Down arrow"},
     {HelpBtnDown,  true,  "Mute"},
     {HelpBtnBack,  false, "Backspace"},
     {HelpBtnBack,  true,  "Exit app"},
+    {HelpBtnText,  false, ""},
+    {HelpBtnText,  false, "In terminal:"},
+    {HelpBtnOk,    false, "Type a prompt"},
+    {HelpBtnOk,    true,  "Command menu"},
+    {HelpBtnRight, true,  "Menu (Help/About)"},
     {HelpBtnText,  false, ""},
     {HelpBtnText,  false, "Install plugin:"},
     {HelpBtnText,  false, "```"},
@@ -1463,6 +1670,25 @@ UiState* ui_alloc(Gui* gui) {
     view_set_context(ui->info_view, ui);
     view_dispatcher_add_view(ui->view_dispatcher, ViewIdInfo, ui->info_view);
 
+    // Terminal view
+    ui->term_view = view_alloc();
+    view_allocate_model(ui->term_view, ViewModelTypeLockFree, sizeof(TermModel));
+    view_set_draw_callback(ui->term_view, term_draw);
+    view_set_input_callback(ui->term_view, term_input);
+    view_set_context(ui->term_view, ui);
+    {
+        TermModel* m = view_get_model(ui->term_view);
+        m->scroll = 0;
+        m->follow = true;
+    }
+    view_dispatcher_add_view(ui->view_dispatcher, ViewIdTerm, ui->term_view);
+
+    // Keyboard (prompt input from the terminal)
+    ui->keyboard = text_input_alloc();
+    view_set_previous_callback(text_input_get_view(ui->keyboard), kb_prev_cb);
+    view_dispatcher_add_view(
+        ui->view_dispatcher, ViewIdKeyboard, text_input_get_view(ui->keyboard));
+
     // Animation timer (150ms tick for character animations)
     ui->anim_timer = furi_timer_alloc(anim_tick, FuriTimerTypePeriodic, ui);
     furi_timer_start(ui->anim_timer, 150);
@@ -1482,10 +1708,14 @@ void ui_free(UiState* ui) {
     view_dispatcher_remove_view(ui->view_dispatcher, ViewIdMenu);
     view_dispatcher_remove_view(ui->view_dispatcher, ViewIdPerm);
     view_dispatcher_remove_view(ui->view_dispatcher, ViewIdInfo);
+    view_dispatcher_remove_view(ui->view_dispatcher, ViewIdTerm);
+    view_dispatcher_remove_view(ui->view_dispatcher, ViewIdKeyboard);
+    text_input_free(ui->keyboard);
     view_free(ui->status_view);
     view_free(ui->menu_view);
     view_free(ui->perm_view);
     view_free(ui->info_view);
+    view_free(ui->term_view);
     view_dispatcher_free(ui->view_dispatcher);
     free(ui);
 }
@@ -1512,7 +1742,8 @@ void ui_show_status(UiState* ui, const char* text, bool connected) {
         m->anim_frame = 0;
     }
     view_commit_model(ui->status_view, true);
-    if(ui->current_view != ViewIdMenu && ui->current_view != ViewIdInfo) {
+    if(ui->current_view != ViewIdMenu && ui->current_view != ViewIdInfo &&
+       ui->current_view != ViewIdTerm) {
         ui->current_view = ViewIdStatus;
         view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdStatus);
     }
@@ -1539,7 +1770,8 @@ void ui_show_status2(UiState* ui, const char* text, const char* subtext, bool co
         m->anim_frame = 0;
     }
     view_commit_model(ui->status_view, true);
-    if(ui->current_view != ViewIdMenu && ui->current_view != ViewIdInfo) {
+    if(ui->current_view != ViewIdMenu && ui->current_view != ViewIdInfo &&
+       ui->current_view != ViewIdTerm) {
         ui->current_view = ViewIdStatus;
         view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdStatus);
     }
@@ -1549,9 +1781,80 @@ void ui_show_menu(UiState* ui) {
     if(!ui) return;
     MenuModel* m = view_get_model(ui->menu_view);
     m->index = 0;
+    m->pick_mode = false;
     view_commit_model(ui->menu_view, true);
     ui->current_view = ViewIdMenu;
     view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdMenu);
+}
+
+void ui_show_pick(UiState* ui, const char* title, const char* pipe_delimited) {
+    if(!ui || !pipe_delimited) return;
+    MenuModel* m = view_get_model(ui->menu_view);
+    m->pick_mode = true;
+    m->pick_index = 0;
+    m->pick_count = 0;
+    strncpy(m->pick_title, title ? title : "", sizeof(m->pick_title) - 1);
+    m->pick_title[sizeof(m->pick_title) - 1] = '\0';
+    const char* p = pipe_delimited;
+    while(*p && m->pick_count < MAX_PICK_ITEMS) {
+        const char* sep = strchr(p, '|');
+        int len = sep ? (int)(sep - p) : (int)strlen(p);
+        if(len > MAX_MENU_ITEM_LEN - 1) len = MAX_MENU_ITEM_LEN - 1;
+        if(len > 0) {
+            memcpy(m->pick_items[m->pick_count], p, len);
+            m->pick_items[m->pick_count][len] = '\0';
+            m->pick_count++;
+        }
+        if(!sep) break;
+        p = sep + 1;
+    }
+    view_commit_model(ui->menu_view, true);
+    ui->current_view = ViewIdMenu;
+    view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdMenu);
+}
+
+/* ── Keyboard (prompt input) ─────────────────────────────────────── */
+
+static void kb_done_cb(void* context) {
+    UiState* ui = context;
+    if(!ui) return;
+    /* Echo the typed prompt into the terminal locally so it appears
+     * even before the host confirms the turn. */
+    if(ui->kb_buf[0]) {
+        char line[TERM_LINE_LEN];
+        const char* p = ui->kb_buf;
+        bool first = true;
+        while(*p) {
+            int n = snprintf(line, sizeof(line), "%s%.*s", first ? "> " : "  ",
+                             (int)sizeof(line) - 4, p);
+            (void)n;
+            term_buf_append(line);
+            int consumed = (int)strlen(line) - 2;
+            if(consumed <= 0) break;
+            p += consumed;
+            first = false;
+        }
+    }
+    if(ui->event_callback && ui->kb_buf[0]) {
+        ui->event_callback(UiEventKeyboardSubmit, ui->kb_buf, ui->event_context);
+    }
+    ui_show_term(ui);
+}
+
+static uint32_t kb_prev_cb(void* context) {
+    UNUSED(context);
+    return ViewIdTerm; /* Back from the keyboard returns to the terminal */
+}
+
+void ui_show_keyboard(UiState* ui) {
+    if(!ui) return;
+    ui->kb_buf[0] = '\0';
+    text_input_reset(ui->keyboard);
+    text_input_set_header_text(ui->keyboard, "Prompt to Claude:");
+    text_input_set_result_callback(
+        ui->keyboard, kb_done_cb, ui, ui->kb_buf, sizeof(ui->kb_buf), true);
+    ui->current_view = ViewIdKeyboard;
+    view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdKeyboard);
 }
 
 void ui_show_info(UiState* ui) {
@@ -1562,6 +1865,44 @@ void ui_show_info(UiState* ui) {
     view_commit_model(ui->info_view, true);
     ui->current_view = ViewIdInfo;
     view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdInfo);
+}
+
+void ui_show_term(UiState* ui) {
+    if(!ui) return;
+    TermModel* m = view_get_model(ui->term_view);
+    m->follow = true;
+    view_commit_model(ui->term_view, true);
+    ui->current_view = ViewIdTerm;
+    view_dispatcher_switch_to_view(ui->view_dispatcher, ViewIdTerm);
+}
+
+void ui_term_append(UiState* ui, const char* pipe_delimited) {
+    if(!ui || !pipe_delimited) return;
+    /* Split on '|' like ui_update_menu; the host replaces literal pipes
+     * in content before sending. Empty segments become blank lines. */
+    char line[TERM_LINE_LEN];
+    const char* p = pipe_delimited;
+    for(;;) {
+        const char* sep = strchr(p, '|');
+        int len = sep ? (int)(sep - p) : (int)strlen(p);
+        if(len > TERM_LINE_LEN - 1) len = TERM_LINE_LEN - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        term_buf_append(line);
+        if(!sep) break;
+        p = sep + 1;
+    }
+    /* Redraw if the terminal is on screen (follow handled in draw). */
+    view_commit_model(ui->term_view, ui->current_view == ViewIdTerm);
+}
+
+void ui_term_clear(UiState* ui) {
+    if(!ui) return;
+    term_buf_clear();
+    TermModel* m = view_get_model(ui->term_view);
+    m->scroll = 0;
+    m->follow = true;
+    view_commit_model(ui->term_view, ui->current_view == ViewIdTerm);
 }
 
 void ui_show_listening(UiState* ui) {

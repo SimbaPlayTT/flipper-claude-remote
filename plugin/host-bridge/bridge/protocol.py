@@ -22,7 +22,9 @@ def decode(line: bytes) -> dict | None:
     if not line:
         return None
     try:
-        msg = json.loads(line)
+        # A corrupted BLE chunk must parse-fail (warning), not raise a
+        # UnicodeDecodeError that the read loop treats as a link failure.
+        msg = json.loads(line.decode("utf-8", errors="replace"))
         if isinstance(msg, dict) and "t" in msg:
             return msg
     except json.JSONDecodeError:
@@ -57,6 +59,24 @@ def ping_msg(rssi: int | None = None) -> bytes:
 
 def menu_msg(items: list[str]) -> bytes:
     return encode("menu", {"items": "|".join(items)})
+
+
+def term_msg(lines: list[str], clr: bool = False, show: bool = False) -> bytes:
+    """Terminal-view lines for the Flipper. Lines must already be sanitized
+    (ASCII, no '|', '"' or '\\') and wrapped to the Flipper's line width —
+    the on-device JSON parser does no unescaping."""
+    d: dict = {"lines": "|".join(lines)}
+    if clr:
+        d["clr"] = True
+    if show:
+        d["show"] = True
+    return encode("term", d)
+
+
+def pick_msg(title: str, items: list[str]) -> bytes:
+    """Option picker for a multi-choice question. Items must be sanitized
+    like term lines (ASCII, no '|', '\"' or '\\\\')."""
+    return encode("pick", {"title": title[:21], "items": "|".join(items)})
 
 
 def perm_msg(tool: str, detail: str = "") -> bytes:
